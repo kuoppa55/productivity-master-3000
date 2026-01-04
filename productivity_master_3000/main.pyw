@@ -21,6 +21,7 @@ LOGIC_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "focus_l
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PM3000_icon.ico")
 APP_NAME = "ProductivityMaster3000"
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_state.json")
 
 # --- ADMIN CHECK ---
 def is_admin():
@@ -184,6 +185,11 @@ class ProductivityMaster3000App(ctk.CTk):
         self.startup_check.grid(row=3, column=0, pady=10)
         if self.settings["startup"]: self.startup_check.select()
 
+        # --- INITIALIZATION ---
+        self.write_focus_state(False)
+
+        self.start_proxy_service()
+
         # --- BACKGROUND SCHEDULER ---
         self.scheduler = BackgroundScheduler()
         self.scheduler.add_job(self.check_schedule_job, 'interval', minutes=1)
@@ -197,12 +203,52 @@ class ProductivityMaster3000App(ctk.CTk):
 
         self.after(100, self.check_schedule_job)
 
+    def write_focus_state(self, is_active):
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump({"focus_active": is_active}, f)
+        except Exception as e:
+            print(f"Failed to write state file: {e}")
+
+    def start_proxy_service(self):
+        if self.proxy_process: return
+
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+        try:
+            self.log_file = open("proxy_log.txt", "w")
+
+            self.proxy_process = subprocess.Popen(
+                ['mitmdump', '-s', LOGIC_SCRIPT],
+                startupinfo=startupinfo,
+                stdout=self.log_file,
+                stderr=self.log_file,
+            )
+            print(f"Global guard started with PID: {self.proxy_process.pid}")
+
+            set_windows_proxy(True)
+        except Exception as e:
+            print(f"Failed to start proxy service: {e}")
+
+    def stop_proxy_service(self):
+        set_windows_proxy(False)
+
+        if self.proxy_process:
+            self.proxy_process.terminate()
+            self.proxy_process = None
+
+        if self.log_file and not self.log_file.closed:
+            self.log_file.close()
+
     def setup_tray_icon(self):
         # Create image for tray
         if os.path.exists(ICON_FILE):
             icon_image = Image.open(ICON_FILE)
         else:
             image = Image.new('RGB', (64, 64), color =  "red")
+            icon_image = image
         
         menu = (
             pystray.MenuItem("Open", self.show_window_from_tray),
@@ -224,9 +270,7 @@ class ProductivityMaster3000App(ctk.CTk):
     def handle_quit_request(self):
         if self.is_focus_active:
             self.deiconify()
-
             self.quit_pending = True
-
             if not self.cooldown_active:
                 self.initiate_cooldown()
         else:
@@ -235,21 +279,30 @@ class ProductivityMaster3000App(ctk.CTk):
 
     def shutdown_sequence(self):
         # Ensure cleanup on exit
-        self.save_preferences
-        if self.is_focus_active:
-            self.stop_focus()
+        self.save_preferences()
+        self.stop_proxy_service()
         self.scheduler.shutdown()
         self.destroy()
         
     def manual_toggle(self):
         if not self.is_focus_active:
             # Start Focus Mode
-            self.start_focus()
+            self.activate_focus_mode()
         else:
             # Stop Focus Mode
             if self.cooldown_active: return
             self.quit_pending = False
             self.initiate_cooldown()
+
+    def activate_focus_mode(self):
+        self.is_focus_active = True
+        self.write_focus_state(True)
+        self.update_ui_state(True)
+
+    def deactivate_focus_mode(self):
+        self.is_focus_active = False
+        self.write_focus_state(False)
+        self.update_ui_state(False)
 
     def initiate_cooldown(self):
         self.cooldown_active = True
@@ -280,7 +333,7 @@ class ProductivityMaster3000App(ctk.CTk):
             self.after(1000, self.cooldown_loop)
         else:
             # Cooldown finished
-            self.stop_focus()
+            self.deactivate_focus_mode()
             self.cooldown_active = False
             self.toggle_btn.configure(state="normal")
             self.progress_bar.grid_remove()
@@ -289,57 +342,11 @@ class ProductivityMaster3000App(ctk.CTk):
                 self.tray_icon.stop()
                 self.shutdown_sequence()
 
-    def start_focus(self):
-        if self.is_focus_active: return
-
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-
-
-        # 1. Start mitmdump in background
-        try:
-            self.log_file = open("proxy_log.txt", "w")
-
-            self.proxy_process = subprocess.Popen(
-                ['mitmdump', '-s', LOGIC_SCRIPT],
-                startupinfo=startupinfo,
-                stdout=self.log_file,
-                stderr=self.log_file,
-            )
-            print(f"MITM started with PID: {self.proxy_process.pid}")
-        except Exception as e:
-            print(f"Failed to start: {e}")
-            return
-        
-        # 2. Enable System Proxy
-        set_windows_proxy(True)
-        self.is_focus_active = True
-        self.update_ui_state(True)
-
-    def stop_focus(self):
-        if not self.is_focus_active: return
-        #1. Disable System Proxy
-        set_windows_proxy(False)
-
-        #2. Kill mitmdump process
-        if self.proxy_process:
-            self.proxy_process.terminate()
-            self.proxy_process = None
-
-        if hasattr(self, 'log_file') and self.log_file and not self.log_file.closed:
-            self.log_file.close()
-        
-        self.is_focus_active = False
-        self.update_ui_state(False)
-
     def update_ui_state(self, active):
         if active:
-            self.toggle_btn.configure(state="normal")
             self.toggle_btn.configure(text="STOP FOCUS", fg_color="#d63031", hover_color="#b71c1c")
             self.status_label.configure(text="STATUS: LOCKED IN", text_color="red")
         else:
-            self.toggle_btn.configure(state="normal")
             self.toggle_btn.configure(text="START FOCUS", fg_color="#1f6aa5", hover_color="#144870")
             self.status_label.configure(text="STATUS: FREE TIME", text_color="green")
 
@@ -398,7 +405,7 @@ class ProductivityMaster3000App(ctk.CTk):
             # If not locked, LOCK IT.
             if self.cooldown_active or not self.is_focus_active:
                 self.cancel_cooldown()
-                self.start_focus()
+                self.activate_focus_mode()
         else:
             if self.sched_switch.cget("state") != "normal":
                 self.sched_switch.configure(state="normal")
