@@ -9,7 +9,9 @@ FOCUS_ONLY_BLOCKS = [
     "youtube.com",
     "reddit.com",
     "boards.4chan.org",
-    "kiwifarms.st"
+    "kiwifarms.st",
+    "x.com",
+    "twitter.com",
 ]
 
 PERMANENT_BLOCKS = [
@@ -59,7 +61,7 @@ def request(flow: http.HTTPFlow) -> None:
     if any(domain in host for domain in FOCUS_ONLY_BLOCKS):
         if "youtube.com" in host:
             if "watch?v=" in url_path:
-                pass # This will get blocked below
+                return # Allow video playback
             elif "studio.youtube.com" in host or "/upload" in url_path:
                 return # Allow creators
             elif "/s/player" in url_path or "/youtubei/" in url_path or "/api/" in url_path:
