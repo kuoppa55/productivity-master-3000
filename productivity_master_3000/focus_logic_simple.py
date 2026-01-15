@@ -4,23 +4,30 @@ import os
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_state.json")
 BLOCK_PAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "block_page.html")
+BLOCKLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.json")
 
-FOCUS_ONLY_BLOCKS = [
-    "youtube.com",
-    "reddit.com",
-    "boards.4chan.org",
-    "kiwifarms.st",
-    "x.com",
-    "twitter.com",
-]
+def load_blocklists():
+    """Load block lists from external config file."""
+    default_config = {
+        "focus_only_blocks": [],
+        "permanent_blocks": []
+    }
 
-PERMANENT_BLOCKS = [
-    "skipthegames.com",
-    "megapersonals.eu",
-    "longisland.bedpage.com",
-    "boards.4chan.org/gif/",
-    "boards.4chan.org/soc/"
-]
+    if not os.path.exists(BLOCKLIST_FILE):
+        return default_config["focus_only_blocks"], default_config["permanent_blocks"]
+
+    try:
+        with open(BLOCKLIST_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            return (
+                config.get("focus_only_blocks", []),
+                config.get("permanent_blocks", [])
+            )
+    except Exception as e:
+        print(f"Error loading blocklist config: {e}")
+        return default_config["focus_only_blocks"], default_config["permanent_blocks"]
+
+FOCUS_ONLY_BLOCKS, PERMANENT_BLOCKS = load_blocklists()
 
 try:
     if os.path.exists(BLOCK_PAGE_FILE):
@@ -43,23 +50,29 @@ def get_focus_state():
     except:
         return False
 
+def domain_matches(host, domain):
+    """Check if host matches domain or is a subdomain of it."""
+    host = host.lower()
+    domain = domain.lower()
+    return host == domain or host.endswith('.' + domain)
+
 def request(flow: http.HTTPFlow) -> None:
     url_path = flow.request.pretty_url
     host = flow.request.pretty_host
 
-    if "googlevideo.com" in host:
+    if domain_matches(host, "googlevideo.com"):
         return
-    
+
     if any(filter_txt in url_path for filter_txt in PERMANENT_BLOCKS):
         block_request(flow)
         return
-    
+
     is_focus_active = get_focus_state()
     if not is_focus_active:
         return
 
-    if any(domain in host for domain in FOCUS_ONLY_BLOCKS):
-        if "youtube.com" in host:
+    if any(domain_matches(host, domain) for domain in FOCUS_ONLY_BLOCKS):
+        if domain_matches(host, "youtube.com"):
             if "watch?v=" in url_path:
                 return # Allow video playback
             elif "studio.youtube.com" in host or "/upload" in url_path:
@@ -68,7 +81,7 @@ def request(flow: http.HTTPFlow) -> None:
                 return # Allow backend API
             else:
                 pass # Block main page/feed
-                
+
         block_request(flow)
 
 def block_request(flow: http.HTTPFlow):
