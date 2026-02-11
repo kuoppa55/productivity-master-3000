@@ -19,3 +19,5 @@ settings.json
 app_state.json
 productivity_master_3000/app_state.json
 productivity_master_3000/blocklist.json
+productivity_master_3000/.pending_schedule.json
+productivity_master_3000/.schedule_backup.json

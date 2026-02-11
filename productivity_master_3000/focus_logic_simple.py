@@ -73,14 +73,18 @@ def request(flow: http.HTTPFlow) -> None:
 
     if any(domain_matches(host, domain) for domain in FOCUS_ONLY_BLOCKS):
         if domain_matches(host, "youtube.com"):
+            # Allow creator tools
+            if "studio.youtube.com" in host or "/upload" in url_path:
+                return
+            # Allow direct video page loads
             if "watch?v=" in url_path:
-                return # Allow video playback
-            elif "studio.youtube.com" in host or "/upload" in url_path:
-                return # Allow creators
-            elif "/s/player" in url_path or "/youtubei/" in url_path or "/api/" in url_path:
-                return # Allow backend API
-            else:
-                pass # Block main page/feed
+                return
+            # Allow only playback-critical API paths
+            if "/s/player" in url_path:
+                return
+            if "/youtubei/v1/player" in url_path:
+                return
+            # Block everything else (browse, search, guide, next, feed)
 
         block_request(flow)
 

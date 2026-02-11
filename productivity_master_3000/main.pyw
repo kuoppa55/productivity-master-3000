@@ -10,6 +10,13 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from PIL import Image
 import pystray
+from schedule_integrity import (
+    compute_schedule_hash,
+    save_pending_schedule,
+    check_and_promote_pending,
+    get_pending_time_remaining,
+    clear_pending,
+)
 
 os.chdir(os.path.dirname(os.path.abspath(__file__))) 
 
@@ -22,6 +29,7 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settin
 ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PM3000_icon.ico")
 APP_NAME = "ProductivityMaster3000"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_state.json")
+SCHEDULE_BACKUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".schedule_backup.json")
 
 # --- ADMIN CHECK ---
 def is_admin():
@@ -86,30 +94,101 @@ class SettingManager:
         return schedule
 
     @staticmethod
+    def _save_schedule_backup(schedule: dict):
+        """Save a backup copy of the current active schedule."""
+        try:
+            with open(SCHEDULE_BACKUP_FILE, "w", encoding="utf-8") as f:
+                json.dump(schedule, f, indent=4)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _load_schedule_backup() -> dict:
+        """Load the schedule backup, falling back to defaults."""
+        if os.path.exists(SCHEDULE_BACKUP_FILE):
+            try:
+                with open(SCHEDULE_BACKUP_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return SettingManager.get_default_schedule()
+
+    @staticmethod
     def load():
+        """Load settings from file with schedule tamper detection.
+
+        If the schedule has been externally modified (hash mismatch),
+        the old schedule is preserved and the new one is placed into a
+        24-hour pending queue. Returns a tuple of (settings, tamper_detected).
+        """
         defaults = {
             "startup": False,
             "scheduler_enabled": False,
             "schedule": SettingManager.get_default_schedule(),
+            "schedule_hash": "",
         }
 
         if not os.path.exists(SETTINGS_FILE):
-            return defaults
-        
+            defaults["schedule_hash"] = compute_schedule_hash(defaults["schedule"])
+            return defaults, False
+
         try:
             with open(SETTINGS_FILE, "r") as f:
                 data = json.load(f)
                 for key, val in defaults.items():
                     if key not in data:
                         data[key] = val
-                return data
-        except:
-            return defaults
-        
+        except Exception:
+            defaults["schedule_hash"] = compute_schedule_hash(defaults["schedule"])
+            return defaults, False
+
+        stored_hash = data.get("schedule_hash", "")
+        current_hash = compute_schedule_hash(data["schedule"])
+
+        # First run or hash field missing — initialize it
+        if not stored_hash:
+            data["schedule_hash"] = current_hash
+            SettingManager.save(data)
+            return data, False
+
+        # Check for external modification
+        if stored_hash != current_hash:
+            # Schedule was tampered with — revert and queue the change
+            promoted = check_and_promote_pending()
+            if promoted is not None:
+                # A previously pending schedule is ready to apply
+                data["schedule"] = promoted
+                data["schedule_hash"] = compute_schedule_hash(promoted)
+                clear_pending()
+                SettingManager.save(data)
+                return data, False
+
+            # Recover the old schedule from the backup or pending file
+            from schedule_integrity import load_pending_schedule
+            existing_pending = load_pending_schedule()
+            if existing_pending is not None:
+                old_schedule = existing_pending["old_schedule"]
+            else:
+                old_schedule = SettingManager._load_schedule_backup()
+
+            new_schedule = data["schedule"]
+            save_pending_schedule(new_schedule, old_schedule)
+
+            # Revert settings.json to the old schedule
+            data["schedule"] = old_schedule
+            data["schedule_hash"] = compute_schedule_hash(old_schedule)
+            SettingManager.save(data)
+            return data, True
+
+        return data, False
+
     @staticmethod
     def save(data):
+        """Save settings to file, always recomputing the schedule hash."""
+        data["schedule_hash"] = compute_schedule_hash(data["schedule"])
         with open(SETTINGS_FILE, "w") as f:
             json.dump(data, f, indent=4)
+        SettingManager._save_schedule_backup(data["schedule"])
 
 # --- API UI CLASS ---
 class ProductivityMaster3000App(ctk.CTk):
@@ -117,11 +196,11 @@ class ProductivityMaster3000App(ctk.CTk):
         super().__init__()
 
         self.title("Productivity Master 3000")
-        self.geometry("400x500")
+        self.geometry("400x550")
         self.resizable(False, False)
 
         # Load Settings
-        self.settings = SettingManager.load()
+        self.settings, self._tamper_detected = SettingManager.load()
         self.is_focus_active = False
         self.cooldown_active = False
         self.proxy_process = None
@@ -162,27 +241,44 @@ class ProductivityMaster3000App(ctk.CTk):
         self.sched_frame = ctk.CTkFrame(self)
         self.sched_frame.grid(row=3, column=0, pady=20, padx=20, sticky="ew")
 
-        ctk.CTkLabel(
+        self.sched_title_label = ctk.CTkLabel(
             self.sched_frame,
-            text="Weekly Schedule Active",
-            font=("Roboto", 12, "bold")
-        ).grid(row=0, column=0, columnspan=2, pady=(10, 5))
+            text="Schedule: Disabled",
+            font=("Roboto", 12, "bold"),
+        )
+        self.sched_title_label.grid(row=0, column=0, columnspan=2, pady=(10, 5))
 
-        ctk.CTkLabel(
+        self.today_schedule_label = ctk.CTkLabel(
             self.sched_frame,
-            text="(Edit settings.json to change times)",
+            text=self._get_today_schedule_text(),
             font=("Roboto", 10),
-            text_color="gray"
-        ).grid(row=1, column=0, columnspan=2, pady=(0, 10))
+            text_color="gray",
+        )
+        self.today_schedule_label.grid(row=1, column=0, columnspan=2, pady=(0, 5))
+
+        self.pending_schedule_label = ctk.CTkLabel(
+            self.sched_frame,
+            text="",
+            font=("Roboto", 10),
+            text_color="orange",
+        )
+        self.pending_schedule_label.grid(row=2, column=0, columnspan=2, pady=(0, 5))
+        self.pending_schedule_label.grid_remove()
 
         # Enable Scheduler Switch
-        self.sched_switch = ctk.CTkSwitch(self.sched_frame, text="Enable Scheduler", command=self.save_preferences)
-        self.sched_switch.grid(row=2, column=0, columnspan=2, pady=5)
-        if self.settings["scheduler_enabled"]: self.sched_switch.select()
+        self.sched_switch = ctk.CTkSwitch(
+            self.sched_frame,
+            text="Enable Scheduler",
+            command=self._on_sched_switch_toggle,
+        )
+        self.sched_switch.grid(row=3, column=0, columnspan=2, pady=(5, 10))
+        if self.settings["scheduler_enabled"]:
+            self.sched_switch.select()
+        self._update_sched_title()
 
         # Startup Checkbox
         self.startup_check = ctk.CTkCheckBox(self, text="Run on Startup", command=self.toggle_startup)
-        self.startup_check.grid(row=3, column=0, pady=10)
+        self.startup_check.grid(row=4, column=0, pady=10)
         if self.settings["startup"]: self.startup_check.select()
 
         # --- INITIALIZATION ---
@@ -362,8 +458,27 @@ class ProductivityMaster3000App(ctk.CTk):
 
     # --- SCHEDULER LOGIC ---
     def _enforce_schedule_logic(self):
+        # Check for pending schedule promotions
+        promoted = check_and_promote_pending()
+        if promoted is not None:
+            self.settings["schedule"] = promoted
+            SettingManager.save(self.settings)
+
+        # Update pending schedule indicator
+        remaining = get_pending_time_remaining()
+        if remaining is not None:
+            self.pending_schedule_label.configure(
+                text=f"Pending schedule change applies in {remaining}",
+            )
+            self.pending_schedule_label.grid()
+        else:
+            self.pending_schedule_label.grid_remove()
+
         #1. Check if Scheduler is enabled in the UI
         is_sched_enabled = self.sched_switch.get()
+
+        # Refresh today's schedule display
+        self.today_schedule_label.configure(text=self._get_today_schedule_text())
 
         if not is_sched_enabled:
             return
@@ -409,6 +524,43 @@ class ProductivityMaster3000App(ctk.CTk):
         else:
             if self.sched_switch.cget("state") != "normal":
                 self.sched_switch.configure(state="normal")
+
+    def _get_today_schedule_text(self) -> str:
+        """Format today's schedule blocks for display.
+
+        Returns:
+            Human-readable string like 'Tuesday: 8:00 AM => 4:00 PM'
+            or 'Tuesday: No focus blocks' if empty.
+        """
+        day_name = datetime.now().strftime("%A")
+        day_rules = self.settings["schedule"].get(day_name, [])
+        if not day_rules:
+            return f"{day_name}: No focus blocks"
+
+        blocks = []
+        for block in day_rules:
+            start_str = block.get("start", "")
+            end_str = block.get("end", "")
+            if start_str and end_str:
+                start_fmt = datetime.strptime(start_str, "%H:%M").strftime("%#I:%M %p")
+                end_fmt = datetime.strptime(end_str, "%H:%M").strftime("%#I:%M %p")
+                blocks.append(f"{start_fmt} => {end_fmt}")
+
+        if not blocks:
+            return f"{day_name}: No focus blocks"
+        return f"{day_name}: {', '.join(blocks)}"
+
+    def _update_sched_title(self):
+        """Update the schedule frame title based on switch state."""
+        if self.sched_switch.get():
+            self.sched_title_label.configure(text="Schedule: Enabled")
+        else:
+            self.sched_title_label.configure(text="Schedule: Disabled")
+
+    def _on_sched_switch_toggle(self):
+        """Handle scheduler switch toggle."""
+        self._update_sched_title()
+        self.save_preferences()
 
     def save_preferences(self):
         self.settings["startup"] = self.startup_check.get()

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.ytjs.dev)",
+      "WebFetch(domain:docs.mitmproxy.org)",
+      "WebFetch(domain:pankajmalhotra.com)"
+    ]
+  }
+}
